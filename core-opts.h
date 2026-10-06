@@ -753,6 +753,8 @@ typedef enum {
 	OPT_io_uring_entries,
 	OPT_io_uring_ops,
 	OPT_io_uring_rand,
+	OPT_io_uring_register_buffers,
+	OPT_io_uring_register_bytes,
 
 	OPT_ipsec_mb,
 	OPT_ipsec_mb_feature,

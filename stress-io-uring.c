@@ -35,18 +35,24 @@
 
 #define MIN_IO_URING_ENTRIES	(1)
 #define MAX_IO_URING_ENTRIES	(16384)
+#define DEFAULT_IO_URING_REGISTER_BYTES	(256 * STRESS_MB)
+#define MAX_IO_URING_REGISTER_BYTES	(STRESS_MINIMUM(MAX_MEM_LIMIT, UINT64_C(1024) * STRESS_GB))
 
 static const stress_help_t help[] = {
 	{ NULL,	"io-uring N",		"start N workers that issue io-uring I/O requests" },
 	{ NULL, "io-uring-entries N",	"specify number if io-uring ring entries" },
 	{ NULL,	"io-uring-ops N",	"stop after N bogo io-uring I/O requests" },
 	{ NULL,	"io-uring-rand",	"enable randomized io-uring I/O request ordering" },
+	{ NULL,	"io-uring-register-buffers", "repeatedly register and unregister populated buffers" },
+	{ NULL,	"io-uring-register-bytes N", "total bytes or percentage of physical memory to register" },
 	{ NULL,	NULL,			NULL }
 };
 
 static const stress_opt_t opts[] = {
 	{ OPT_io_uring_entries, "io-uring-entries", TYPE_ID_UINT32, MIN_IO_URING_ENTRIES, MAX_IO_URING_ENTRIES, NULL },
 	{ OPT_io_uring_rand,    "io-uring-rand",    TYPE_ID_BOOL,   0, 1, NULL },
+	{ OPT_io_uring_register_buffers, "io-uring-register-buffers", TYPE_ID_BOOL, 0, 1, NULL },
+	{ OPT_io_uring_register_bytes, "io-uring-register-bytes", TYPE_ID_SIZE_T_BYTES_VM, STRESS_KB, MAX_IO_URING_REGISTER_BYTES, NULL },
 	END_OPT,
 };
 
@@ -959,9 +965,149 @@ static const char *stress_io_uring_opcode_name(const uint8_t opcode)
 }
 
 /*
- *  stress_io_uring
- *	stress asynchronous I/O
+ *  stress_io_uring_register_buffers
+ *	stress long-term pinning of populated anonymous buffers
  */
+static int stress_io_uring_register_buffers(stress_args_t *args)
+{
+#if defined(__NR_io_uring_register)
+	struct io_uring_params params;
+	struct iovec *iovecs;
+	size_t bytes = DEFAULT_IO_URING_REGISTER_BYTES;
+	size_t buffers;
+	int fd;
+	int rc = EXIT_SUCCESS;
+
+	if (!stress_setting_get("io-uring-register-bytes", &bytes)) {
+		if (g_opt_flags & OPT_FLAGS_MAXIMIZE)
+			bytes = MAX_IO_URING_REGISTER_BYTES;
+		if (g_opt_flags & OPT_FLAGS_MINIMIZE)
+			bytes = args->page_size;
+	}
+	bytes /= args->instances;
+	bytes &= ~(args->page_size - 1);
+	if (bytes < args->page_size)
+		bytes = args->page_size;
+
+#if defined(RLIMIT_MEMLOCK)
+	{
+		struct rlimit limit;
+		struct rlimit unlimited = { RLIM_INFINITY, RLIM_INFINITY };
+
+		if (getrlimit(RLIMIT_MEMLOCK, &limit) == 0) {
+			if (setrlimit(RLIMIT_MEMLOCK, &unlimited) < 0) {
+				limit.rlim_cur = limit.rlim_max;
+				(void)setrlimit(RLIMIT_MEMLOCK, &limit);
+			}
+			if ((getrlimit(RLIMIT_MEMLOCK, &limit) == 0) &&
+			    (limit.rlim_cur != RLIM_INFINITY) && (limit.rlim_cur < bytes)) {
+				pr_inf_skip("%s: buffer size exceeds RLIMIT_MEMLOCK, skipping stressor\n",
+					args->name);
+				return EXIT_NO_RESOURCE;
+			}
+		}
+	}
+#endif
+	(void)shim_memset(&params, 0, sizeof(params));
+	fd = shim_io_uring_setup(2, &params);
+	if (fd < 0) {
+		const int err = errno;
+
+		pr_inf_skip("%s: io-uring setup failed, errno=%d (%s), skipping stressor\n",
+			args->name, err, strerror(err));
+		return ((err == EPERM) || (err == ENOSYS)) ? EXIT_NOT_IMPLEMENTED : EXIT_NO_RESOURCE;
+	}
+	buffers = bytes / STRESS_GB + ((bytes % STRESS_GB) != 0);
+	iovecs = calloc(buffers, sizeof(*iovecs));
+	if (!iovecs) {
+		(void)close(fd);
+		return EXIT_NO_RESOURCE;
+	}
+	pr_dbg("%s: registering %zu bytes per worker in %zu buffers\n", args->name, bytes, buffers);
+	stress_proc_state_set(args->name, STRESS_STATE_SYNC_WAIT);
+	stress_sync_start_wait(args);
+	stress_proc_state_set(args->name, STRESS_STATE_RUN);
+
+	do {
+		uint8_t *buffer;
+		size_t offset;
+		size_t index;
+
+		if ((g_opt_flags & OPT_FLAGS_OOM_AVOID) && stress_memory_low_check(bytes)) {
+			pr_inf_skip("%s: insufficient allocation headroom for %zu bytes, skipping stressor\n",
+				args->name, bytes);
+			rc = EXIT_NO_RESOURCE;
+			break;
+		}
+		buffer = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (buffer == MAP_FAILED) {
+			pr_inf_skip("%s: mmap of %zu bytes failed, errno=%d (%s), skipping stressor\n",
+				args->name, bytes, errno, strerror(errno));
+			rc = EXIT_NO_RESOURCE;
+			break;
+		}
+		stress_memory_anon_name_set(buffer, bytes, "io-uring-register");
+		for (offset = 0; (offset < bytes) && stress_continue(args); offset += STRESS_MB)
+			(void)shim_memset(buffer + offset, 0xa5, STRESS_MINIMUM(bytes - offset, STRESS_MB));
+		for (offset = 0; (offset < bytes) && stress_continue(args); offset += args->page_size)
+			*(uint64_t *)(buffer + offset) = (uint64_t)offset;
+		if (!stress_continue(args)) {
+			(void)munmap(buffer, bytes);
+			break;
+		}
+		for (offset = 0, index = 0; index < buffers; index++) {
+			iovecs[index].iov_base = buffer + offset;
+			iovecs[index].iov_len = STRESS_MINIMUM(bytes - offset, STRESS_GB);
+			offset += iovecs[index].iov_len;
+		}
+		if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS, iovecs, buffers) < 0) {
+			const int err = errno;
+
+			if (err == ENOMEM) {
+				pr_inf_skip("%s: cannot register %zu bytes, insufficient pinnable memory\n",
+					args->name, bytes);
+				rc = EXIT_NO_RESOURCE;
+			} else {
+				pr_fail("%s: buffer registration failed, errno=%d (%s)\n",
+					args->name, err, strerror(err));
+				rc = EXIT_FAILURE;
+			}
+			(void)munmap(buffer, bytes);
+			break;
+		}
+		for (offset = 0; offset < bytes; offset += args->page_size) {
+			if ((*(uint64_t *)(buffer + offset) != (uint64_t)offset) ||
+			    (buffer[offset + args->page_size - 1] != 0xa5)) {
+				pr_fail("%s: registered buffer data changed at offset %zu\n", args->name, offset);
+				rc = EXIT_FAILURE;
+				break;
+			}
+		}
+		if (syscall(__NR_io_uring_register, fd, IORING_UNREGISTER_BUFFERS, NULL, 0) < 0) {
+			pr_fail("%s: buffer unregistration failed, errno=%d (%s)\n",
+				args->name, errno, strerror(errno));
+				rc = EXIT_FAILURE;
+			(void)close(fd);
+			fd = -1;
+		}
+		(void)munmap(buffer, bytes);
+		if (rc != EXIT_SUCCESS)
+			break;
+		stress_bogo_inc(args);
+	} while (stress_continue(args));
+
+	stress_proc_state_set(args->name, STRESS_STATE_DEINIT);
+	free(iovecs);
+	if (fd >= 0)
+		(void)close(fd);
+	return rc;
+#else
+	pr_inf_skip("%s: built without io_uring_register syscall support\n", args->name);
+	return EXIT_NOT_IMPLEMENTED;
+#endif
+}
+
 static int stress_io_uring_child(stress_args_t *args, void *context)
 {
 	int ret;
@@ -979,8 +1125,12 @@ static int stress_io_uring_child(stress_args_t *args, void *context)
 	stress_io_uring_user_data_t user_data[SIZEOF_ARRAY(stress_io_uring_setups)];
 	const int32_t cpus = stress_cpus_online_get();
 	int flags;
+	bool register_buffers = false;
 
 	(void)context;
+	(void)stress_setting_get("io-uring-register-buffers", &register_buffers);
+	if (register_buffers)
+		return stress_io_uring_register_buffers(args);
 
 	/* Minor tweaking based on empirical testing */
 	if (cpus > 128)
@@ -1143,6 +1293,7 @@ static const stress_exercises_t exercises[] = {
 
 	STRESS_EX_SYSCALL("io_uring_setup"),
 	STRESS_EX_SYSCALL("io_uring_enter"),
+	STRESS_EX_SYSCALL("io_uring_register"),
 	STRESS_EX_END,
 };
 

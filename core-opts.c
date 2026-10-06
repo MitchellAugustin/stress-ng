@@ -639,6 +639,8 @@ const struct option stress_long_options[] = {
 	{ "io-uring-entries",	1,	NULL,	OPT_io_uring_entries },
 	{ "io-uring-ops",	1,	NULL,	OPT_io_uring_ops },
 	{ "io-uring-rand",	0,	NULL,	OPT_io_uring_rand },
+	{ "io-uring-register-buffers", 0,	NULL,	OPT_io_uring_register_buffers },
+	{ "io-uring-register-bytes", 1,	NULL,	OPT_io_uring_register_bytes },
 
 	{ "ipsec-mb",		1,	NULL,	OPT_ipsec_mb },
 	{ "ipsec-mb-feature",	1,	NULL,	OPT_ipsec_mb_feature },

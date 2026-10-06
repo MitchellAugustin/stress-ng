@@ -5146,6 +5146,31 @@ stop after N rounds of io-uring operations.
 .TP
 .B \-\-io\-uring\-rand
 randomize order of io-uring operations and file seek locations.
+.TP
+.B \-\-io\-uring\-register\-buffers
+Instead of file I/O operations, repeatedly populate anonymous memory, register
+it with IORING_REGISTER_BUFFERS, check data markers in each page, unregister
+the buffers and unmap the memory. Registration exercises long-term page pinning
+and migration of pages that cannot be pinned in place. Each page has a unique
+marker to prevent identical pages being merged when KSM is enabled. Each buffer is at most
+1 GiB. One successful register, check and unregister cycle is one bogo operation.
+This requires Linux io_uring support and sufficient RLIMIT_MEMLOCK; raising
+this limit may require privilege. The existing io-uring entries and randomized
+I/O options do not apply to this mode. Large allocations may trigger global
+OOM even when free memory remains in pageblocks ineligible for long-term pins.
+The usual OOM restart and resource-exhaustion handling still applies; this is
+not by itself a strict pass/fail memory-capacity test.
+.TP
+.B \-\-io\-uring\-register\-bytes N
+Specify the total memory to register across all io-uring workers in buffer
+registration mode. The default is 256 MiB total. Sizes may have b, k, m, g or t
+suffixes, or be a percentage of physical memory, using the same sizing helper
+as the vm and mmap stressors. Where supported, percentages are based on
+currently free physical pages when the option is parsed, otherwise on total
+physical pages. They are not based on MemAvailable or a cgroup memory limit.
+The total is divided between workers and rounded down to page boundaries,
+with at least one page per worker. Each worker can register at most 1024
+buffers. This option only applies with \-\-io\-uring\-register\-buffers.
 .RE
 .TP
 .B IPsec multi-buffer cryptographic stressor
